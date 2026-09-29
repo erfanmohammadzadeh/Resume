@@ -1,433 +1,545 @@
 # -*- coding: utf-8 -*-
-"""Build a professional resume .docx using only the Python standard library."""
+"""Build a resume .docx from the Markdown file next to this script.
+
+Edit the Markdown, then run:
+
+    python build_resume_docx.py
+
+The .docx is rewritten from the Markdown. Nothing in the resume is hardcoded.
+
+    python build_resume_docx.py --watch
+
+rebuilds whenever you save the Markdown.
+
+Markdown shape this script understands
+--------------------------------------
+# Your Name
+**Headline under the name**
+
+Contact line with optional [label](https://...) links
+
+## Any section title
+
+Plain paragraphs, including **bold** and [links](https://...).
+
+Skills — a Markdown table (header row is skipped):
+
+| Area | Tools |
+|---|---|
+| Languages | C++, Python |
+
+Jobs — title line, italic date line, then bullets:
+
+**Job title** — Company · City
+*Month Year – Month Year*
+- Bullet with **highlights**
+
+Projects — title line, description, optional italic tools line:
+
+**Project name** — Place · Date
+What you did.
+*Tools, libraries*
+
+Education — bold title, then a details line, then an optional paragraph:
+
+**Degree**
+School · City · dates · GPA
+Optional notes.
+
+Certificates — title line, then a URL or [label](url):
+
+**Certificate name** — Issuer · Date
+https://...
+
+Label lists:
+
+- **Language:** level
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+import time
 import zipfile
 from pathlib import Path
 from xml.sax.saxutils import escape
-
-OUT = Path(__file__).resolve().parent / "Erfan_Mohammadzadeh_Resume.docx"
-DESKTOP = Path(r"C:\Users\Amvaj Negar - EM\Desktop") / "Erfan_Mohammadzadeh_Resume.docx"
 
 NAVY = "1B365D"
 ACCENT = "2C5F8A"
 MUTED = "555555"
 BODY = "222222"
-RULE = "C5CDD6"
+
+ENTRY_HEADER = re.compile(r"^\*\*(.+?)\*\*(.*)$")
+LEADING_SEP = re.compile(r"^(?:—|–|-)\s*")
+INLINE = re.compile(
+    r"\*\*(.+?)\*\*"
+    r"|\*(.+?)\*"
+    r"|\[([^\]]+)\]\(([^)]+)\)"
+    r"|(https?://[^\s)]+)"
+)
+LABEL_BULLET = re.compile(r"^\*\*([^*]+?:\s*)\*\*\s*(.+)$")
+TABLE_RULE = re.compile(r"^:?-{3,}:?$")
+SOLE_LINK = re.compile(r"^\[([^\]]+)\]\(([^)]+)\)$")
+SOLE_URL = re.compile(r"^https?://\S+$")
 
 
-def t(text, xml_space=False):
-    attrs = ' xml:space="preserve"' if xml_space else ""
-    return f"<w:t{attrs}>{escape(text)}</w:t>"
+class Span:
+    def __init__(self, text, bold=False, italic=False, url=None):
+        self.text = text
+        self.bold = bold
+        self.italic = italic
+        self.url = url
 
 
-def r(text, *, bold=False, italic=False, size=21, color=BODY, font="Calibri", space=False):
+class Builder:
+    def __init__(self):
+        self.links = []  # (rid, url) in first-seen order
+
+    def rid_for(self, url):
+        for rid, existing in self.links:
+            if existing == url:
+                return rid
+        rid = "rIdLink%d" % (len(self.links) + 1)
+        self.links.append((rid, url))
+        return rid
+
+
+def xml_text(text):
+    preserve = bool(text[:1].isspace() or text[-1:].isspace())
+    attrs = ' xml:space="preserve"' if preserve else ""
+    return "<w:t%s>%s</w:t>" % (attrs, escape(text))
+
+
+def r(text, *, bold=False, italic=False, size=21, color=BODY, font="Calibri"):
+    if not text:
+        return ""
     rpr = [
-        f'<w:rFonts w:ascii="{font}" w:hAnsi="{font}" w:cs="{font}"/>',
-        f'<w:sz w:val="{size}"/>',
-        f'<w:szCs w:val="{size}"/>',
-        f'<w:color w:val="{color}"/>',
+        '<w:rFonts w:ascii="%s" w:hAnsi="%s" w:cs="%s"/>' % (font, font, font),
+        '<w:sz w:val="%d"/>' % size,
+        '<w:szCs w:val="%d"/>' % size,
+        '<w:color w:val="%s"/>' % color,
     ]
     if bold:
         rpr.append("<w:b/><w:bCs/>")
     if italic:
         rpr.append("<w:i/><w:iCs/>")
-    return f"<w:r><w:rPr>{''.join(rpr)}</w:rPr>{t(text, space)}</w:r>"
+    return "<w:r><w:rPr>%s</w:rPr>%s</w:r>" % ("".join(rpr), xml_text(text))
 
 
-def hyperlink(rid, text, *, size=18, color=ACCENT):
+def hyperlink(builder, url, text, *, size=18, color=ACCENT):
+    rid = builder.rid_for(url)
     rpr = (
-        f'<w:rFonts w:ascii="Calibri" w:hAnsi="Calibri"/>'
-        f'<w:sz w:val="{size}"/><w:szCs w:val="{size}"/>'
-        f'<w:color w:val="{color}"/><w:u w:val="single"/>'
+        '<w:rFonts w:ascii="Calibri" w:hAnsi="Calibri"/>'
+        '<w:sz w:val="%d"/><w:szCs w:val="%d"/>'
+        '<w:color w:val="%s"/><w:u w:val="single"/>' % (size, size, color)
     )
     return (
-        f'<w:hyperlink r:id="{rid}" w:history="1">'
-        f"<w:r><w:rPr>{rpr}</w:rPr>{t(text)}</w:r></w:hyperlink>"
+        '<w:hyperlink r:id="%s" w:history="1">'
+        "<w:r><w:rPr>%s</w:rPr>%s</w:r></w:hyperlink>"
+        % (rid, rpr, xml_text(text))
     )
 
 
-def p(runs, *, align="left", before=0, after=60, line=240, border=False, rtl=False):
-    jc = f'<w:jc w:val="{align}"/>'
-    sp = f'<w:spacing w:before="{before}" w:after="{after}" w:line="{line}" w:lineRule="auto"/>'
-    ind = ""
+def p(runs, *, align="left", before=0, after=60, line=240, border=False):
+    chunks = [piece for piece in runs if piece]
+    if not chunks:
+        return ""
+    jc = '<w:jc w:val="%s"/>' % align
+    sp = (
+        '<w:spacing w:before="%d" w:after="%d" w:line="%d" w:lineRule="auto"/>'
+        % (before, after, line)
+    )
     bdr = ""
     if border:
         bdr = (
-            f'<w:pBdr><w:bottom w:val="single" w:sz="12" w:space="4" '
-            f'w:color="{NAVY}"/></w:pBdr>'
+            '<w:pBdr><w:bottom w:val="single" w:sz="12" w:space="4" '
+            'w:color="%s"/></w:pBdr>' % NAVY
         )
-    if rtl:
-        ind = "<w:bidi/>"
-    return f"<w:p><w:pPr>{jc}{sp}{bdr}{ind}</w:pPr>{''.join(runs)}</w:p>"
+    return "<w:p><w:pPr>%s%s%s</w:pPr>%s</w:p>" % (jc, sp, bdr, "".join(chunks))
 
 
 def heading(text):
     return p(
-        [r(text.upper(), bold=True, size=22, color=NAVY, font="Calibri")],
+        [r(text.upper(), bold=True, size=22, color=NAVY)],
         before=200,
         after=80,
         border=True,
     )
 
 
-def job_header(title, company, dates):
-    return (
-        p(
-            [
-                r(title, bold=True, size=22, color=BODY),
-                r("  |  ", size=20, color=MUTED),
-                r(company, bold=True, size=21, color=ACCENT),
-            ],
-            after=0,
-        )
-        + p([r(dates, italic=True, size=18, color=MUTED)], before=0, after=40)
-    )
+def parse_inline(text):
+    spans = []
+    pos = 0
+    for match in INLINE.finditer(text):
+        if match.start() > pos:
+            spans.append(Span(text[pos : match.start()]))
+        if match.group(1) is not None:
+            spans.append(Span(match.group(1), bold=True))
+        elif match.group(2) is not None:
+            spans.append(Span(match.group(2), italic=True))
+        elif match.group(3) is not None:
+            spans.append(Span(match.group(3), url=match.group(4).strip()))
+        else:
+            url = match.group(5)
+            spans.append(Span(url, url=url))
+        pos = match.end()
+    if pos < len(text):
+        spans.append(Span(text[pos:]))
+    return [span for span in spans if span.text]
 
 
-def bullet(text_parts):
-    """text_parts is a list of r() fragments already built, or a plain string."""
-    if isinstance(text_parts, str):
-        runs = [r(text_parts, size=20)]
-    else:
-        runs = text_parts
+def render_spans(builder, spans, *, size=20, color=BODY, bold=False, italic=False):
+    pieces = []
+    for span in spans:
+        if span.url:
+            pieces.append(hyperlink(builder, span.url, span.text, size=size, color=ACCENT))
+        else:
+            pieces.append(
+                r(
+                    span.text,
+                    bold=bold or span.bold,
+                    italic=italic or span.italic,
+                    size=size,
+                    color=color,
+                )
+            )
+    return pieces
+
+
+def is_entry_header(line):
+    return line.startswith("**") and "**" in line[2:]
+
+
+def is_wrapped_italic(line):
+    return len(line) >= 2 and line.startswith("*") and line.endswith("*") and not line.startswith("**")
+
+
+def unwrap_italic(line):
+    if is_wrapped_italic(line):
+        return line[1:-1].strip()
+    return line
+
+
+def parse_header(line):
+    match = ENTRY_HEADER.match(line.strip())
+    if not match:
+        return line.strip(), None
+    title = match.group(1).strip()
+    rest = LEADING_SEP.sub("", match.group(2).strip()).strip()
+    return title, rest or None
+
+
+def sole_link(line):
+    match = SOLE_LINK.match(line.strip())
+    if match:
+        return match.group(1).strip(), match.group(2).strip()
+    if SOLE_URL.match(line.strip()):
+        return line.strip(), line.strip()
+    return None
+
+
+def strip_comments(text):
+    return re.sub(r"<!--.*?-->", "", text, flags=re.S)
+
+
+def parse_resume(text):
+    lines = strip_comments(text).splitlines()
+    name = ""
+    headline = ""
+    contact = []
+    sections = []
+    i = 0
+    n = len(lines)
+
+    def blank(idx):
+        return not lines[idx].strip() or lines[idx].strip() == "---"
+
+    while i < n and blank(i):
+        i += 1
+    if i < n and lines[i].startswith("# "):
+        name = lines[i][2:].strip()
+        i += 1
+    while i < n and blank(i):
+        i += 1
+    if i < n and lines[i].strip().startswith("**") and not lines[i].startswith("##"):
+        headline = unwrap_italic(lines[i].strip())
+        if headline.startswith("**") and headline.endswith("**"):
+            headline = headline[2:-2].strip()
+        i += 1
+    while i < n and not lines[i].startswith("##"):
+        stripped = lines[i].strip()
+        if stripped and stripped != "---":
+            contact.append(stripped)
+        i += 1
+
+    while i < n:
+        if not lines[i].startswith("## "):
+            i += 1
+            continue
+        title = lines[i][3:].strip()
+        i += 1
+        body = []
+        while i < n and not lines[i].startswith("## "):
+            body.append(lines[i].rstrip())
+            i += 1
+        sections.append((title, body))
+
+    if not name:
+        raise SystemExit("Markdown needs a top heading: # Your Name")
+    return {"name": name, "headline": headline, "contact": contact, "sections": sections}
+
+
+def is_table_rule(cells):
+    return bool(cells) and all(TABLE_RULE.match(cell.replace(" ", "")) for cell in cells)
+
+
+def render_table(builder, rows_lines):
+    rows = []
+    for line in rows_lines:
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        if is_table_rule(cells):
+            if rows:
+                rows.pop()
+            continue
+        rows.append(cells)
+    parts = []
+    for cells in rows:
+        if not cells or not any(cells):
+            continue
+        label = cells[0]
+        value = " · ".join(cell for cell in cells[1:] if cell)
+        runs = [r(label + ":  ", bold=True, size=20)]
+        runs.extend(render_spans(builder, parse_inline(value), size=20))
+        parts.append(p(runs, before=20, after=20))
+    return parts
+
+
+def render_bullet_list(builder, bullet_lines):
+    texts = [line.strip()[2:].strip() for line in bullet_lines]
+    labels = [LABEL_BULLET.match(text) for text in texts]
+    parts = []
+    if all(labels):
+        for match in labels:
+            parts.append(
+                p(
+                    [
+                        r(match.group(1) + "  ", bold=True, size=20),
+                        *render_spans(builder, parse_inline(match.group(2)), size=20),
+                    ],
+                    before=20,
+                    after=20,
+                )
+            )
+        return parts
+    for text in texts:
+        parts.append(bullet(builder, text))
+    return parts
+
+
+def bullet(builder, text):
     ppr = (
-        '<w:pPr>'
+        "<w:pPr>"
         '<w:spacing w:before="20" w:after="40" w:line="240" w:lineRule="auto"/>'
         '<w:ind w:left="360" w:hanging="200"/>'
         "</w:pPr>"
     )
-    mark = r("•  ", size=20, color=ACCENT, space=True)
-    return f"<w:p>{ppr}{mark}{''.join(runs)}</w:p>"
+    mark = r("•  ", size=20, color=ACCENT)
+    runs = "".join(render_spans(builder, parse_inline(text), size=20))
+    return "<w:p>%s%s%s</w:p>" % (ppr, mark, runs)
 
 
-def rb(text, **kw):
-    kw.setdefault("size", 20)
-    return r(text, bold=True, **kw)
+def render_entry(builder, lines, first):
+    raw = [line.strip() for line in lines if line.strip() and line.strip() != "---"]
+    if not raw:
+        return []
+    title, meta = parse_header(raw[0])
+    rest = raw[1:]
+    bullets = [line[2:].strip() for line in rest if line.startswith("- ")]
+    other = [line for line in rest if not line.startswith("- ")]
 
+    date = None
+    if bullets and other and is_wrapped_italic(other[0]):
+        date = unwrap_italic(other[0])
+        other = other[1:]
 
-def rn(text, **kw):
-    kw.setdefault("size", 20)
-    return r(text, **kw)
+    link = None
+    if not bullets and len(other) == 1:
+        link = sole_link(other[0])
+        if link:
+            other = []
 
+    tech = None
+    if not bullets and other and is_wrapped_italic(other[-1]):
+        tech = unwrap_italic(other[-1])
+        other = other[:-1]
 
-body = []
+    before = 40 if first else 150
+    parts = []
 
-# Header
-body.append(
-    p(
-        [r("ERFAN MOHAMMADZADEH", bold=True, size=44, color=NAVY, font="Calibri")],
-        align="center",
-        after=40,
-    )
-)
-body.append(
-    p(
-        [
-            r(
-                "Software Engineer  ·  Data Engineer  ·  C++ / Qt  ·  C# / .NET Web API",
-                size=18,
-                color=ACCENT,
+    if bullets:
+        runs = [r(title, bold=True, size=22, color=BODY)]
+        if meta:
+            runs.append(r("  |  ", size=20, color=MUTED))
+            runs.append(r(meta, bold=True, size=21, color=ACCENT))
+        parts.append(p(runs, before=before, after=0))
+        if date:
+            parts.append(
+                p(
+                    render_spans(builder, parse_inline(date), size=18, color=MUTED, italic=True),
+                    before=0,
+                    after=40,
+                )
             )
-        ],
-        align="center",
-        after=80,
-    )
-)
-body.append(
-    p(
-        [
-            r("Iran  ·  ", size=18, color=MUTED),
-            r("(+98) 913 406 5696  ·  ", size=18, color=MUTED),
-            hyperlink("rIdEmail", "erfanmohammadzadeh.en@gmail.com", size=18),
-            r("  ·  ", size=18, color=MUTED),
-            hyperlink("rIdLi", "LinkedIn", size=18),
-            r("  ·  ", size=18, color=MUTED),
-            hyperlink("rIdGh", "GitHub", size=18),
-        ],
-        align="center",
-        after=120,
-        border=True,
-    )
-)
+        for paragraph in other:
+            parts.append(p(render_spans(builder, parse_inline(paragraph), size=20), after=40))
+        for item in bullets:
+            parts.append(bullet(builder, item))
+        return parts
 
-body.append(heading("Professional Summary"))
-body.append(
-    p(
-        [
-            rn(
-                "Software and data engineer specializing in high-performance C++/Qt applications, "
-                "sensor and signal pipelines, and structured geospatial reconstruction. I also build "
-                "C# / .NET backends: ASP.NET Core Web APIs, REST CRUD endpoints, and database-backed "
-                "persistence. I take raw measurements (cameras, LiDAR, ECG) through filtering, feature "
-                "extraction, validation, visualization, and export—and store or expose results through "
-                "SQL and structured APIs. My next step is to deepen production .NET service and database work."
+    if link:
+        runs = [r(title, bold=True, size=21)]
+        if meta:
+            runs.append(r("  —  " + meta, size=20, color=MUTED))
+        parts.append(p(runs, before=before, after=20))
+        label, url = link
+        parts.append(p([hyperlink(builder, url, label, size=18)], after=60))
+        return parts
+
+    if meta:
+        runs = [r(title, bold=True, size=21)]
+        runs.append(r("  —  " + meta, size=19, color=MUTED))
+        parts.append(p(runs, before=before, after=20))
+        for index, paragraph in enumerate(other):
+            last = index == len(other) - 1 and not tech
+            parts.append(
+                p(render_spans(builder, parse_inline(paragraph), size=20), after=40 if last else 20)
             )
-        ],
-        after=80,
-    )
-)
+        if tech:
+            parts.append(
+                p(
+                    render_spans(builder, parse_inline(tech), size=18, color=MUTED, italic=True),
+                    before=0,
+                    after=40,
+                )
+            )
+        return parts
 
-body.append(heading("Technical Skills"))
-skills = [
-    ("Languages", "C++, C#, Python, SQL, QML"),
-    (".NET / backend", "ASP.NET Core, Web API, REST CRUD, service-layer APIs"),
-    ("Data & storage", "SQL databases, SQLite, XML, structured ETL-style pipelines"),
-    ("Desktop & UI", "Qt (Widgets / QML)"),
-    ("Vision & 3D", "OpenCV, PCL, VTK, CGAL, Open3D"),
-    ("Geospatial", "PDAL, GDAL, QGIS, City4CFD / LoD modeling"),
-    ("Systems", "Linux (LPIC-1), cross-platform desktop builds"),
-    ("Domains", "ECG / biomedical DSP, camera calibration, ANPR, LiDAR city models"),
-]
-for label, val in skills:
+    parts.append(p([r(title, bold=True, size=21)], before=before, after=0))
+    if other:
+        parts.append(
+            p(
+                render_spans(builder, parse_inline(other[0]), size=18, color=MUTED, italic=True),
+                before=0,
+                after=40,
+            )
+        )
+        for paragraph in other[1:]:
+            parts.append(p(render_spans(builder, parse_inline(paragraph), size=20), after=60))
+    return parts
+
+
+def render_section_body(builder, lines):
+    parts = []
+    i = 0
+    n = len(lines)
+    first_entry = True
+    while i < n:
+        stripped = lines[i].strip()
+        if not stripped or stripped == "---":
+            i += 1
+            continue
+        if stripped.startswith("|"):
+            j = i
+            while j < n and lines[j].strip().startswith("|"):
+                j += 1
+            parts.extend(render_table(builder, lines[i:j]))
+            i = j
+            continue
+        if stripped.startswith("- "):
+            j = i
+            while j < n and lines[j].strip().startswith("- "):
+                j += 1
+            parts.extend(render_bullet_list(builder, lines[i:j]))
+            i = j
+            continue
+        if is_entry_header(stripped):
+            j = i + 1
+            while j < n and not is_entry_header(lines[j].strip()):
+                j += 1
+            parts.extend(render_entry(builder, lines[i:j], first_entry))
+            first_entry = False
+            i = j
+            continue
+        paragraph = [stripped]
+        i += 1
+        while i < n:
+            nxt = lines[i].strip()
+            if (
+                not nxt
+                or nxt == "---"
+                or nxt.startswith("|")
+                or nxt.startswith("- ")
+                or is_entry_header(nxt)
+            ):
+                break
+            paragraph.append(nxt)
+            i += 1
+        parts.append(p(render_spans(builder, parse_inline(" ".join(paragraph)), size=20), after=80))
+    return parts
+
+
+def build_document(resume, builder):
+    body = []
     body.append(
         p(
-            [rb(label + ":  ", size=20, space=True), rn(val)],
-            before=20,
-            after=20,
+            [r(resume["name"].upper(), bold=True, size=44, color=NAVY)],
+            align="center",
+            after=40,
         )
     )
-
-body.append(heading("Career Direction"))
-body.append(
-    p(
-        [
-            rn(
-                "Growing toward C# / .NET backend engineering: ASP.NET Core Web APIs, CRUD over "
-                "relational data, and connecting desktop and processing products to maintainable "
-                "service and database layers."
+    if resume["headline"]:
+        body.append(
+            p(
+                render_spans(builder, parse_inline(resume["headline"]), size=18, color=ACCENT),
+                align="center",
+                after=80,
             )
-        ],
-        after=80,
-    )
-)
-
-body.append(heading("Work Experience"))
-
-body.append(
-    job_header(
-        "Geospatial Data Engineer",
-        "Image Horizon (Data Horizon)  ·  Tehran, Iran",
-        "November 2025 – Present  (concurrent with Amvaj Negar)",
-    )
-)
-body.append(
-    bullet(
-        [
-            rn("Own the "),
-            rb("City4CFD / QCity4CFD"),
-            rn(" reconstruction path: point clouds and building footprints to "),
-            rb("LoD 2.2"),
-            rn(" city meshes for CFD, covering "),
-            rb("20,000+ buildings"),
-            rn("."),
-        ]
-    )
-)
-body.append(
-    bullet(
-        [
-            rn("Built processing stages with "),
-            rb("PCL, PDAL, GDAL, CGAL, and VTK"),
-            rn(": filtering, segmentation, surface reconstruction, geometric regularization, rendering, and mesh QA."),
-        ]
-    )
-)
-body.append(
-    bullet(
-        [
-            rn("Reported "),
-            rb(">90% reconstruction accuracy"),
-            rn(" on the high-detail building pipeline (Python / NumPy / Open3D / PDAL + GIS in QGIS / ArcGIS)."),
-        ]
-    )
-)
-body.append(
-    bullet(
-        "Bridged GIS operators and simulation teams by producing inspectable, simulation-ready geometry instead of raw point clouds."
-    )
-)
-
-body.append(
-    job_header(
-        "Senior Software Engineer",
-        "Amvaj Negar Sepahan Co.  ·  Isfahan, Iran",
-        "April 2024 – Present",
-    )
-)
-body.append(
-    bullet(
-        [
-            rn("Designed and maintain "),
-            rb("Holter ECG desktop software"),
-            rn(" (C++ / Qt Widgets): long-term ECG ingest, "),
-            rb("P-Q-R-S-T"),
-            rn(" detection, beat-template classification, arrhythmia support, SQLite persistence, XML/PDF reporting."),
-        ]
-    )
-)
-body.append(
-    bullet(
-        [
-            rn("Built "),
-            rb("QCardio"),
-            rn(", a validation harness for ECG libraries: converted "),
-            rb("MIT-BIH Arrhythmia"),
-            rn(" into a structured test set so algorithms are checked against physician-annotated ground truth."),
-        ]
-    )
-)
-body.append(
-    bullet(
-        "Own signal-processing correctness: filtering, feature extraction, classification, and regression tests that clinicians and engineers can both trust."
-    )
-)
-
-body.append(
-    job_header(
-        "Software Engineer",
-        "Data Image Rayan Co.  ·  Isfahan, Iran",
-        "June 2024 – March 2025  (concurrent with Amvaj Negar)",
-    )
-)
-body.append(
-    bullet(
-        [
-            rn("Delivered "),
-            rb("ANPR"),
-            rn(" monitoring for parking access: live cameras, vehicle detection, plate crop, OCR validation, and barrier control."),
-        ]
-    )
-)
-body.append(
-    bullet(
-        "Reduced manual gate intervention by closing the loop from video frame to access decision with a real-time image pipeline."
-    )
-)
-
-body.append(
-    job_header(
-        "Junior Software Engineer",
-        "Tivan Sanat (Dade Pardazan Tivan Sanat)  ·  Isfahan, Iran",
-        "April 2021 – December 2022",
-    )
-)
-body.append(
-    bullet(
-        [
-            rn("Shipped a cross-platform "),
-            rb("C++/Qt + OpenCV"),
-            rn(" camera-calibration tool: target detection, keypoints, intrinsics/extrinsics, distortion (radial/tangential), focal length, principal point, FOV, and correction matrices."),
-        ]
-    )
-)
-body.append(
-    bullet(
-        "Exported calibration results (SQLite / XML / PDF) for production optical QA."
-    )
-)
-
-body.append(heading("Selected Projects"))
-
-projects = [
-    (
-        "ASP.NET Core Web API (CRUD)",
-        "Current backend practice",
-        "REST endpoints for create / read / update / delete against a SQL database; request handling, data access, and API structure for service-oriented products.",
-    ),
-    (
-        "QCity4CFD",
-        "Data Horizon  ·  Jan 2025",
-        "LoD 2.2 reconstruction from LiDAR and footprints; mesh regularization and CFD-oriented city models. Python, Open3D, PDAL, CGAL, QGIS/ArcGIS, City4CFD.",
-    ),
-    (
-        "QCardio",
-        "Amvaj Negar Sepahan  ·  Jun 2026",
-        "ECG library validation against annotated MIT-BIH records; automated pass/fail on clinical waveforms.",
-    ),
-    (
-        "ECG Holter Software",
-        "Amvaj Negar Sepahan  ·  Apr 2024",
-        "Desktop Holter analysis: wave detection, templates, arrhythmia flags, reports. C++, Qt Widgets, SQLite, XML/PDF.",
-    ),
-    (
-        "Visible-camera parameter tester",
-        "Tivan Sanat  ·  Dec 2022",
-        "Production calibration of practical camera parameters for accurate rendering and metrology. C++, Qt, OpenCV.",
-    ),
-]
-for name, meta, desc in projects:
-    body.append(
-        p(
-            [rb(name, size=21), rn("  —  " + meta, size=19, color=MUTED)],
-            before=80,
-            after=20,
         )
-    )
-    body.append(p([rn(desc)], after=40))
-
-body.append(heading("Education"))
-body.append(
-    p(
-        [
-            rb("B.Sc. Electrical Engineering — Communication Systems"),
-        ],
-        after=0,
-    )
-)
-body.append(
-    p(
-        [r("Semnan University  ·  Semnan, Iran  ·  Oct 2019 – Jan 2024  ·  GPA 3.2 / 4.0", italic=True, size=18, color=MUTED)],
-        after=40,
-    )
-)
-body.append(
-    p(
-        [
-            rn(
-                "Coursework and practice in signal processing, communications, and control; applied DSP "
-                "(filtering, features, real-time classification) in subsequent industry systems."
+    contact = resume["contact"]
+    for index, line in enumerate(contact):
+        last = index == len(contact) - 1
+        body.append(
+            p(
+                render_spans(builder, parse_inline(line), size=18, color=MUTED),
+                align="center",
+                before=0,
+                after=120 if last else 20,
+                border=last,
             )
-        ]
+        )
+    for title, lines in resume["sections"]:
+        body.append(heading(title))
+        body.extend(render_section_body(builder, lines))
+
+    document_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"\n'
+        '            xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">\n'
+        "  <w:body>\n    %s\n"
+        "    <w:sectPr>\n"
+        '      <w:pgSz w:w="12240" w:h="15840"/>\n'
+        '      <w:pgMar w:top="720" w:right="720" w:bottom="720" w:left="720" '
+        'w:header="360" w:footer="360"/>\n'
+        "    </w:sectPr>\n  </w:body>\n</w:document>\n"
+        % "".join(body)
     )
-)
+    return document_xml
 
-body.append(heading("Certificates"))
-body.append(
-    p(
-        [rb("Foundations of Coding: Full-Stack"), rn("  —  Microsoft / Coursera  ·  Oct 2025")],
-        after=20,
-    )
-)
-body.append(
-    p([hyperlink("rIdCert", "coursera.org/account/accomplishments/verify/XIAL95E2ZNBP", size=18)], after=80)
-)
 
-body.append(heading("Languages"))
-body.append(p([rb("Persian (Farsi):  ", space=True), rn("Native")], after=20))
-body.append(
-    p(
-        [
-            rb("English:  ", space=True),
-            rn(
-                "Professional working proficiency (reading, writing, speaking, listening) — used for technical documentation, code, and work communication."
-            ),
-        ]
-    )
-)
-
-document_xml = f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
-            xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
-  <w:body>
-    {''.join(body)}
-    <w:sectPr>
-      <w:pgSz w:w="12240" w:h="15840"/>
-      <w:pgMar w:top="720" w:right="720" w:bottom="720" w:left="720" w:header="360" w:footer="360"/>
-    </w:sectPr>
-  </w:body>
-</w:document>
-'''
-
-content_types = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+def package_xml(resume, builder):
+    content_types = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
   <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
   <Default Extension="xml" ContentType="application/xml"/>
@@ -436,27 +548,28 @@ content_types = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
   <Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>
   <Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/>
 </Types>
-'''
-
-rels = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+"""
+    rels = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
   <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
   <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/>
   <Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties" Target="docProps/app.xml"/>
 </Relationships>
-'''
-
-doc_rels = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-  <Relationship Id="rIdStyles" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
-  <Relationship Id="rIdEmail" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="mailto:erfanmohammadzadeh.en@gmail.com" TargetMode="External"/>
-  <Relationship Id="rIdLi" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://www.linkedin.com/in/erfan-mohammadzade-076791178" TargetMode="External"/>
-  <Relationship Id="rIdGh" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://github.com/erfan-mohammadzade" TargetMode="External"/>
-  <Relationship Id="rIdCert" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://www.coursera.org/account/accomplishments/verify/XIAL95E2ZNBP" TargetMode="External"/>
-</Relationships>
-'''
-
-styles = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+"""
+    link_xml = []
+    for rid, url in builder.links:
+        safe = escape(url, {'"': "&quot;"})
+        link_xml.append(
+            '  <Relationship Id="%s" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="%s" TargetMode="External"/>'
+            % (rid, safe)
+        )
+    doc_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">\n'
+        '  <Relationship Id="rIdStyles" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>\n'
+        "%s\n</Relationships>\n" % "\n".join(link_xml)
+    )
+    styles = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:docDefaults>
     <w:rPrDefault>
@@ -477,42 +590,121 @@ styles = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
     <w:qFormat/>
   </w:style>
 </w:styles>
-'''
-
-core = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties"
-                   xmlns:dc="http://purl.org/dc/elements/1.1/"
-                   xmlns:dcterms="http://purl.org/dc/terms/"
-                   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
-  <dc:title>Erfan Mohammadzadeh — Resume</dc:title>
-  <dc:creator>Erfan Mohammadzadeh</dc:creator>
-  <cp:lastModifiedBy>Erfan Mohammadzadeh</cp:lastModifiedBy>
-</cp:coreProperties>
-'''
-
-app = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+"""
+    safe_name = escape(resume["name"])
+    core = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+        '<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties"\n'
+        '                   xmlns:dc="http://purl.org/dc/elements/1.1/"\n'
+        '                   xmlns:dcterms="http://purl.org/dc/terms/"\n'
+        '                   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">\n'
+        "  <dc:title>%s — Resume</dc:title>\n"
+        "  <dc:creator>%s</dc:creator>\n"
+        "  <cp:lastModifiedBy>%s</cp:lastModifiedBy>\n"
+        "</cp:coreProperties>\n" % (safe_name, safe_name, safe_name)
+    )
+    app = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties">
-  <Application>Microsoft Word</Application>
+  <Application>Python</Application>
 </Properties>
-'''
+"""
+    return content_types, rels, doc_rels, styles, core, app
 
 
-def write_docx(path: Path):
+def write_docx(path, resume, builder, document_xml):
+    content_types, rels, doc_rels, styles, core, app = package_xml(resume, builder)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as z:
-        z.writestr("[Content_Types].xml", content_types)
-        z.writestr("_rels/.rels", rels)
-        z.writestr("word/document.xml", document_xml)
-        z.writestr("word/styles.xml", styles)
-        z.writestr("word/_rels/document.xml.rels", doc_rels)
-        z.writestr("docProps/core.xml", core)
-        z.writestr("docProps/app.xml", app)
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("[Content_Types].xml", content_types)
+        archive.writestr("_rels/.rels", rels)
+        archive.writestr("word/document.xml", document_xml.encode("utf-8"))
+        archive.writestr("word/styles.xml", styles)
+        archive.writestr("word/_rels/document.xml.rels", doc_rels)
+        archive.writestr("docProps/core.xml", core.encode("utf-8"))
+        archive.writestr("docProps/app.xml", app)
 
 
-write_docx(OUT)
-try:
-    write_docx(DESKTOP)
-except OSError:
-    pass
-print(OUT)
-print("bytes", OUT.stat().st_size)
+def output_path(resume, folder):
+    safe = re.sub(r'[<>:"/\\|?*]', "", resume["name"]).strip()
+    safe = re.sub(r"\s+", "_", safe) or "Resume"
+    return folder / ("%s_Resume.docx" % safe)
+
+
+def find_markdown(explicit):
+    if explicit:
+        path = Path(explicit)
+        if not path.exists():
+            raise SystemExit("Markdown file not found: %s" % path)
+        return path
+    here = Path(__file__).resolve().parent
+    preferred = sorted(here.glob("Resume_*.md"))
+    if len(preferred) == 1:
+        return preferred[0]
+    found = sorted(here.glob("*.md"))
+    if len(found) == 1:
+        return found[0]
+    if not found:
+        raise SystemExit("Put a .md resume next to build_resume_docx.py")
+    names = ", ".join(path.name for path in found)
+    raise SystemExit("More than one .md file. Pass the path. Found: %s" % names)
+
+
+def generate(md_path):
+    text = md_path.read_text(encoding="utf-8")
+    resume = parse_resume(text)
+    builder = Builder()
+    document_xml = build_document(resume, builder)
+    # Fail before writing if the Word XML is not well formed.
+    from xml.etree import ElementTree
+
+    ElementTree.fromstring(document_xml.encode("utf-8"))
+    folder = md_path.resolve().parent
+    destination = output_path(resume, folder)
+    try:
+        write_docx(destination, resume, builder, document_xml)
+    except PermissionError:
+        raise SystemExit("Close %s in Word, then run this script again." % destination.name)
+    desktop = Path.home() / "Desktop" / destination.name
+    if desktop.resolve() != destination.resolve():
+        try:
+            write_docx(desktop, resume, builder, document_xml)
+        except OSError:
+            pass
+    print("Read  %s" % md_path.name)
+    print("Wrote %s (%d bytes)" % (destination, destination.stat().st_size))
+    return destination
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Build a .docx resume from a Markdown file.")
+    parser.add_argument("markdown", nargs="?", help="Resume Markdown. Defaults to the .md file next to this script.")
+    parser.add_argument("--watch", action="store_true", help="Rebuild each time the Markdown file is saved.")
+    args = parser.parse_args(argv)
+    md_path = find_markdown(args.markdown)
+    if not args.watch:
+        generate(md_path)
+        return
+    print("Watching %s — save the file to rebuild. Ctrl+C to stop." % md_path.name)
+    last = None
+    while True:
+        try:
+            mtime = md_path.stat().st_mtime_ns
+        except OSError as exc:
+            print(exc)
+            time.sleep(1)
+            continue
+        if mtime != last:
+            last = mtime
+            try:
+                generate(md_path)
+            except SystemExit as exc:
+                print(exc)
+        time.sleep(0.8)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nStopped.")
+        sys.exit(0)

@@ -2,7 +2,7 @@
 **Software Engineer | Data Engineer | C++ / Qt | C# / .NET Web API**
 
 Iran · (+98) 913 406 5696 · [erfanmohammadzadeh.en@gmail.com](mailto:erfanmohammadzadeh.en@gmail.com)  
-LinkedIn: [erfan-mohammadzade-076791178](https://www.linkedin.com/in/erfan-mohammadzade-076791178) · GitHub: [erfan-mohammadzade](https://github.com/erfan-mohammadzade)
+LinkedIn: [erfan-mohammadzade-076791178](https://www.linkedin.com/in/erfan-mohammadzade-076791178) · GitHub: [erfanmohammadzadeh](https://github.com/erfanmohammadzadeh)
 
 ---
 
@@ -38,7 +38,7 @@ Growing toward **C# / .NET backend engineering**: ASP.NET Core Web APIs, CRUD ov
 **Geospatial Data Engineer** — Image Horizon (Data Horizon) · Tehran, Iran  
 *November 2025 – Present (concurrent with Amvaj Negar)*
 
-- Own the **City4CFD / QCity4CFD** reconstruction path: point clouds + building footprints → **LoD 2.2** city meshes for CFD, covering **20,000+ buildings**.
+- Own the **City4CFD / QCity4CFD** reconstruction path: point clouds + building footprints → **LoD 3.0/2.2/2.0/1.3/1.0** city meshes for CFD, covering **20,000+ buildings**.
 - Built processing stages with **PCL, PDAL, GDAL, CGAL, and VTK**: filtering, segmentation, surface reconstruction, geometric regularization, rendering, and mesh QA.
 - Reported **>90% reconstruction accuracy** on the high-detail building pipeline (Python/NumPy/Open3D/PDAL + GIS in QGIS/ArcGIS).
 - Bridged GIS operators and simulation teams by producing inspectable, simulation-ready geometry instead of raw point clouds.
